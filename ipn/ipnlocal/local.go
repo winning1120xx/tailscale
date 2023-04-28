@@ -491,6 +491,7 @@ func (b *LocalBackend) maybePauseControlClientLocked() {
 	if b.cc == nil {
 		return
 	}
+	// XXX should check for local control
 	networkUp := b.prevIfState.AnyInterfaceUp()
 	b.cc.SetPaused((b.state == ipn.Stopped && b.netMap != nil) || !networkUp)
 }

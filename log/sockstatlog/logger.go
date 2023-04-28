@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"tailscale.com/envknob"
 	"tailscale.com/logpolicy"
 	"tailscale.com/logtail"
 	"tailscale.com/logtail/filch"
@@ -96,6 +97,10 @@ func SockstatLogID(logID logid.PublicID) logid.PrivateID {
 // The netMon parameter is optional; if non-nil it's used to do faster interface lookups.
 func NewLogger(logdir string, logf logger.Logf, logID logid.PublicID, netMon *netmon.Monitor) (*Logger, error) {
 	if !sockstats.IsAvailable {
+		return nil, nil
+	}
+
+	if envknob.NoLogsNoSupport() {
 		return nil, nil
 	}
 

@@ -334,6 +334,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		return nil, fmt.Errorf("wgengine: %v", err)
 	}
 	closePool.add(e.magicConn)
+	// XXX probably don't want any kind of local derp/control check here, just started
 	e.magicConn.SetNetworkUp(e.netMon.InterfaceState().AnyInterfaceUp())
 
 	tsTUNDev.SetDiscoKey(e.magicConn.DiscoPublicKey())
@@ -1102,7 +1103,7 @@ func (e *userspaceEngine) LinkChange(_ bool) {
 }
 
 func (e *userspaceEngine) linkChange(changed bool, cur *interfaces.State) {
-	up := cur.AnyInterfaceUp()
+	up := e.netMon.AnyInterfaceUp(cur)
 	if !up {
 		e.logf("LinkChange: all links down; pausing: %v", cur)
 	} else if changed {

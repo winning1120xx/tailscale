@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/netip"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 
@@ -22,6 +23,7 @@ import (
 
 // LoginEndpointForProxyDetermination is the URL used for testing
 // which HTTP proxy the system should use.
+// XXX should this be the login server as specified on command line?
 var LoginEndpointForProxyDetermination = "https://controlplane.tailscale.com/"
 
 // Tailscale returns the current machine's Tailscale interface, if any.
@@ -273,6 +275,8 @@ type State struct {
 	// IsExpensive is whether the current network interface is
 	// considered "expensive", which currently means LTE/etc
 	// instead of Wifi. This field is not populated by GetState.
+
+	// XXX unused?
 	IsExpensive bool
 
 	// DefaultRouteInterface is the interface name for the
@@ -347,7 +351,7 @@ func (s *State) String() string {
 	if s.PAC != "" {
 		fmt.Fprintf(&sb, " pac=%s", s.PAC)
 	}
-	fmt.Fprintf(&sb, " v4=%v v6=%v}", s.HaveV4, s.HaveV6)
+	fmt.Fprintf(&sb, " v4=%v v6=%v", s.HaveV4, s.HaveV6)
 	return sb.String()
 }
 
@@ -471,6 +475,7 @@ func (s *State) HasPAC() bool { return s != nil && s.PAC != "" }
 
 // AnyInterfaceUp reports whether any interface seems like it has Internet access.
 func (s *State) AnyInterfaceUp() bool {
+	fmt.Println("foo's stack:", string(debug.Stack()))
 	if runtime.GOOS == "js" {
 		return true
 	}
@@ -520,6 +525,7 @@ func GetState() (*State, error) {
 		}
 		for _, pfx := range pfxs {
 			if pfx.Addr().IsLoopback() {
+				// XXX this doesn't seem to trigger on any address
 				continue
 			}
 			s.HaveV6 = s.HaveV6 || isUsableV6(pfx.Addr())
@@ -540,6 +546,7 @@ func GetState() (*State, error) {
 		}
 	}
 
+	// XXX should be allowed if control is local
 	if s.AnyInterfaceUp() {
 		req, err := http.NewRequest("GET", LoginEndpointForProxyDetermination, nil)
 		if err != nil {

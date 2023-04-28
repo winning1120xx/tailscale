@@ -9,6 +9,8 @@ package netmon
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"net/netip"
 	"runtime"
 	"sync"
@@ -55,19 +57,21 @@ type Monitor struct {
 	change chan struct{}
 	stop   chan struct{} // closed on Stop
 
-	mu         sync.Mutex // guards all following fields
-	cbs        set.HandleSet[ChangeFunc]
-	ruleDelCB  set.HandleSet[RuleDeleteCallback]
-	ifState    *interfaces.State
-	gwValid    bool       // whether gw and gwSelfIP are valid
-	gw         netip.Addr // our gateway's IP
-	gwSelfIP   netip.Addr // our own IP address (that corresponds to gw)
-	started    bool
-	closed     bool
-	goroutines sync.WaitGroup
-	wallTimer  *time.Timer // nil until Started; re-armed AfterFunc per tick
-	lastWall   time.Time
-	timeJumped bool // whether we need to send a changed=true after a big time jump
+	mu           sync.Mutex // guards all following fields
+	cbs          set.HandleSet[ChangeFunc]
+	ruleDelCB    set.HandleSet[RuleDeleteCallback]
+	ifState      *interfaces.State
+	gwValid      bool       // whether gw and gwSelfIP are valid
+	gw           netip.Addr // our gateway's IP
+	gwSelfIP     netip.Addr // our own IP address (that corresponds to gw)
+	started      bool
+	closed       bool
+	goroutines   sync.WaitGroup
+	wallTimer    *time.Timer // nil until Started; re-armed AfterFunc per tick
+	lastWall     time.Time
+	timeJumped   bool // whether we need to send a changed=true after a big time jump
+	localDERP    bool // whether our home DERP is accessible via loopback
+	localControl bool // whether control is accessible via loopback
 }
 
 // ChangeFunc is a callback function registered with Monitor that's called when the
@@ -115,6 +119,67 @@ func (m *Monitor) InterfaceState() *interfaces.State {
 
 func (m *Monitor) interfaceStateUncached() (*interfaces.State, error) {
 	return interfaces.GetState()
+}
+
+// IsLocalServer checks the provided hostname of a DERP or control
+// server to see if it is accessible from some loopback or link-local
+// device. If so, we consider the loopback interface a valid interface
+// for the purposes of reaching tailscale clients.
+
+func (m *Monitor) IsLocalServer(hostname string) bool {
+	ips, err := net.LookupIP(hostname)
+	if err != nil {
+		return false
+	}
+	for _, stdIP := range ips {
+		if ip, ok := netip.AddrFromSlice(stdIP); ok {
+			fmt.Println("XXX checking ", ip)
+			if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+				fmt.Println("XXX local derp! ", ip)
+				return true
+				// XXX where do we set it as false? in close I think
+			}
+		}
+	}
+	return false
+}
+
+func (m *Monitor) NoteLocalDERP(hostname string) {
+	m.localDERP = m.IsLocalServer(hostname)
+}
+
+func (m *Monitor) NoteLocalControl(hostname string) {
+	m.localControl = m.IsLocalServer(hostname)
+}
+
+func (m *Monitor) ResetLocalDERP() {
+	fmt.Println("XXX clearing local derp")
+	m.localDERP = false
+}
+
+func (m *Monitor) ResetLocalControl() {
+	m.localControl = false
+}
+
+func (m *Monitor) AnyInterfaceUp(cur *interfaces.State) bool {
+	if m.localControl || m.localDERP {
+		return true
+	}
+	return cur.AnyInterfaceUp()
+}
+
+func (m *Monitor) IsControlReachable(cur *interfaces.State) bool {
+	if m.localControl {
+		return true
+	}
+	return cur.AnyInterfaceUp()
+}
+
+func (m *Monitor) IsDERPReachable(cur *interfaces.State) bool {
+	if m.localDERP {
+		return true
+	}
+	return cur.AnyInterfaceUp()
 }
 
 // GatewayAndSelfIP returns the current network's default gateway, and

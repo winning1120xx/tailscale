@@ -1620,6 +1620,11 @@ func (c *Conn) derpWriteChanOfAddr(addr netip.AddrPort, peer key.NodePublic) cha
 		startGate = c.derpStarted
 		go func() {
 			dc.Connect(ctx)
+			if c.myDerp == regionID {
+				// XXX is this the right hostname?
+				host := c.derpMap.Regions[regionID].Nodes[0].HostName
+				c.netMon.NoteLocalDERP(host)
+			}
 			close(c.derpStarted)
 			c.muCond.Broadcast()
 		}()
@@ -2914,6 +2919,7 @@ func (c *Conn) closeDerpLocked(regionID int, why string) {
 		go ad.c.Close()
 		ad.cancel()
 		delete(c.activeDerp, regionID)
+		c.netMon.ResetLocalDERP()
 		metricNumDERPConns.Set(int64(len(c.activeDerp)))
 	}
 }

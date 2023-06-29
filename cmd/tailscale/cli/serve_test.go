@@ -8,6 +8,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -780,6 +781,11 @@ func (lc *fakeLocalServeClient) SetServeConfig(ctx context.Context, config *ipn.
 	lc.setCount += 1
 	lc.config = config.Clone()
 	return nil
+}
+
+func (lc *fakeLocalServeClient) StreamFunnel(ctx context.Context, hp ipn.HostPort) (io.ReadCloser, error) {
+	// TODO: testing :)
+	return nil, nil
 }
 
 // exactError returns an error checker that wants exactly the provided want error.

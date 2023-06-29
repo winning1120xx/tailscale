@@ -240,8 +240,9 @@ type LocalBackend struct {
 	lastServeConfJSON mem.RO              // last JSON that was parsed into serveConfig
 	serveConfig       ipn.ServeConfigView // or !Valid if none
 
-	serveListeners     map[netip.AddrPort]*serveListener // addrPort => serveListener
-	serveProxyHandlers sync.Map                          // string (HTTPHandler.Proxy) => *httputil.ReverseProxy
+	serveListeners     map[netip.AddrPort]*serveListener                // addrPort => serveListener
+	serveProxyHandlers sync.Map                                         // string (HTTPHandler.Proxy) => *httputil.ReverseProxy
+	funnelStreamers    map[uint16]map[uint32]func(ipn.FunnelRequestLog) // serve port => map of stream loggers (key is UUID)
 
 	// statusLock must be held before calling statusChanged.Wait() or
 	// statusChanged.Broadcast().

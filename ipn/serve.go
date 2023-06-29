@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/exp/slices"
 	"tailscale.com/tailcfg"
@@ -42,6 +43,21 @@ type ServeConfig struct {
 // There is no implicit port 443. It must contain a colon.
 type HostPort string
 
+// Port extracts just the port number from hp.
+// An error is reported in the case that the hp does not
+// have a valid numeric port ending.
+func (hp HostPort) Port() (uint16, error) {
+	_, port, err := net.SplitHostPort(string(hp))
+	if err != nil {
+		return 0, err
+	}
+	port16, err := strconv.ParseUint(port, 10, 16)
+	if err != nil {
+		return 0, err
+	}
+	return uint16(port16), nil
+}
+
 // A FunnelConn wraps a net.Conn that is coming over a
 // Funnel connection. It can be used to determine further
 // information about the connection, like the source address
@@ -60,6 +76,25 @@ type FunnelConn struct {
 	// node which is relaying the connection. That address
 	// can be found in Conn.RemoteAddr.
 	Src netip.AddrPort
+}
+
+// FunnelRequestLog is the JSON type written out to io.Writers
+// watching funnel connections via ipnlocal.StreamFunnel.
+//
+// This structure is in development and subject to change.
+type FunnelRequestLog struct {
+	Time time.Time `json:",omitempty"` // time of request forwarding
+
+	// SrcAddr is the address that initiated the Funnel request.
+	SrcAddr netip.AddrPort `json:",omitempty"`
+
+	// The following fields are only populated if the connection
+	// initiated from another node on the client's tailnet.
+
+	NodeName        string   `json:",omitempty"` // src node MagicDNS name
+	NodeTags        []string `json:",omitempty"` // src node tags
+	UserLoginName   string   `json:",omitempty"` // src node's owner login (if not tagged)
+	UserDisplayName string   `json:",omitempty"` // src node's owner name (if not tagged)
 }
 
 // WebServerConfig describes a web server's configuration.

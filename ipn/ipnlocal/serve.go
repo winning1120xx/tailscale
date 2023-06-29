@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/exp/slices"
 	"tailscale.com/ipn"
 	"tailscale.com/logtail/backoff"
@@ -257,6 +258,111 @@ func (b *LocalBackend) ServeConfig() ipn.ServeConfigView {
 	return b.serveConfig
 }
 
+// StreamFunnel opens a stream to write any incoming connections made
+// to the given HostPort out to the listening io.Writer.
+//
+// If Funnel was not already enabled for the HostPort, it is enabled
+// in the ServeConfig for the duration of the context's lifespan and
+// then turned off once the context is done.
+// If Funnel was already enabled, the ServeConfig is untouched.
+func (b *LocalBackend) StreamFunnel(ctx context.Context, w io.Writer, hp ipn.HostPort) (err error) {
+	port, err := hp.Port()
+	if err != nil {
+		return err
+	}
+
+	// Turn on Funnel for the given HostPort.
+	sc := b.ServeConfig().AsStruct()
+	funnelOn := sc.AllowFunnel != nil && sc.AllowFunnel[hp] == true
+	if !funnelOn {
+		mak.Set(&sc.AllowFunnel, hp, true)
+		if err := b.SetServeConfig(sc); err != nil {
+			return err
+		}
+
+		// Defer turning off Funnel once stream ends.
+		defer func() {
+			sc := b.ServeConfig().AsStruct()
+			delete(sc.AllowFunnel, hp)
+			err = errors.Join(err, b.SetServeConfig(sc))
+		}()
+	}
+
+	f, ok := w.(http.Flusher)
+	if !ok {
+		return errors.New("writer not a flusher")
+	}
+
+	var writeErrs []error
+	writeToStream := func(log ipn.FunnelRequestLog) {
+		jsonLog, err := json.Marshal(log)
+		if err != nil {
+			writeErrs = append(writeErrs, err)
+			return
+		}
+		if _, err := fmt.Fprintf(w, "%s\n", jsonLog); err != nil {
+			writeErrs = append(writeErrs, err)
+			return
+		}
+		f.Flush()
+	}
+
+	// Hook up connections stream.
+	b.mu.Lock()
+	mak.NonNil(&b.funnelStreamers)
+	if b.funnelStreamers[port] == nil {
+		b.funnelStreamers[port] = make(map[uint32]func(ipn.FunnelRequestLog))
+	}
+	id := uuid.New()
+	b.funnelStreamers[port][id.ID()] = writeToStream
+	b.mu.Unlock()
+
+	// Clean up streamer when done.
+	defer func() {
+		b.mu.Lock()
+		mak.NonNil(&b.funnelStreamers)
+		delete(b.funnelStreamers[port], id.ID())
+		b.mu.Unlock()
+	}()
+
+	select {
+	case <-ctx.Done():
+		// Triggered by foreground `tailscale funnel` process
+		// (the streamer) getting closed, or by turning off Tailscale.
+	}
+
+	return errors.Join(writeErrs...)
+}
+
+// maybeLogFunnelConnection logs out an ipn.FunnelRequestLog for the
+// connection to any streamers currently watching the given destPort.
+func (b *LocalBackend) maybeLogFunnelConnection(destPort uint16, srcAddr netip.AddrPort) {
+	b.mu.Lock()
+	streamers := b.funnelStreamers[destPort]
+	b.mu.Unlock()
+	if len(streamers) == 0 {
+		return
+	}
+
+	var log ipn.FunnelRequestLog
+	log.SrcAddr = srcAddr
+	log.Time = time.Now() // TODO: use a different clock somewhere?
+
+	if node, user, ok := b.WhoIs(srcAddr); ok {
+		log.NodeName = node.ComputedName
+		if node.IsTagged() {
+			log.NodeTags = node.Tags
+		} else {
+			log.UserLoginName = user.LoginName
+			log.UserDisplayName = user.DisplayName
+		}
+	}
+
+	for _, stream := range streamers {
+		stream(log)
+	}
+}
+
 func (b *LocalBackend) HandleIngressTCPConn(ingressPeer *tailcfg.Node, target ipn.HostPort, srcAddr netip.AddrPort, getConnOrReset func() (net.Conn, bool), sendRST func()) {
 	b.mu.Lock()
 	sc := b.serveConfig
@@ -359,6 +465,7 @@ func (b *LocalBackend) tcpHandlerForServe(dport uint16, srcAddr netip.AddrPort) 
 	if backDst := tcph.TCPForward(); backDst != "" {
 		return func(conn net.Conn) error {
 			defer conn.Close()
+			b.maybeLogFunnelConnection(dport, srcAddr)
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			backConn, err := b.dialer.SystemDial(ctx, "tcp", backDst)
 			cancel()
@@ -522,6 +629,10 @@ func (b *LocalBackend) serveWebHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if c, ok := getServeHTTPContext(r); ok {
+		b.maybeLogFunnelConnection(c.DestPort, c.SrcAddr)
+	}
+
 	if s := h.Text(); s != "" {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		io.WriteString(w, s)

@@ -95,6 +95,7 @@ var handler = map[string]localAPIHandler{
 	"set-expiry-sooner":           (*Handler).serveSetExpirySooner,
 	"start":                       (*Handler).serveStart,
 	"status":                      (*Handler).serveStatus,
+	"stream-funnel":               (*Handler).serveStreamFunnel,
 	"tka/init":                    (*Handler).serveTKAInit,
 	"tka/log":                     (*Handler).serveTKALog,
 	"tka/modify":                  (*Handler).serveTKAModify,
@@ -840,6 +841,32 @@ func (h *Handler) serveServeConfig(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (h *Handler) serveStreamFunnel(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		// Write permission required because we modify the
+		// ServeConfig to enable funnel.
+		http.Error(w, "funnel stream denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	hp := new(ipn.HostPort)
+	if err := json.NewDecoder(r.Body).Decode(hp); err != nil {
+		writeErrorJSON(w, fmt.Errorf("decoding HostPort: %w", err))
+		return
+	}
+
+	w.(http.Flusher).Flush()
+	w.Header().Set("Content-Type", "application/json")
+	if err := h.b.StreamFunnel(r.Context(), w, *hp); err != nil {
+		writeErrorJSON(w, fmt.Errorf("streaming funnel: %w", err))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) serveCheckIPForwarding(w http.ResponseWriter, r *http.Request) {

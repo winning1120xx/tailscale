@@ -946,6 +946,14 @@ func (lc *LocalClient) NetworkLockForceLocalDisable(ctx context.Context) error {
 	return nil
 }
 
+// NetworkLockDisable shuts down network-lock across the tailnet.
+func (lc *LocalClient) NetworkLockDisable(ctx context.Context, secret []byte) error {
+	if _, err := lc.send(ctx, "POST", "/localapi/v0/tka/disable", 200, bytes.NewReader(secret)); err != nil {
+		return fmt.Errorf("error: %w", err)
+	}
+	return nil
+}
+
 // NetworkLockVerifySigningDeeplink verifies the network lock deeplink contained
 // in url and returns information extracted from it.
 func (lc *LocalClient) NetworkLockVerifySigningDeeplink(ctx context.Context, url string) (*tka.DeeplinkValidationResult, error) {
@@ -971,14 +979,6 @@ func (lc *LocalClient) SetServeConfig(ctx context.Context, config *ipn.ServeConf
 	return nil
 }
 
-// NetworkLockDisable shuts down network-lock across the tailnet.
-func (lc *LocalClient) NetworkLockDisable(ctx context.Context, secret []byte) error {
-	if _, err := lc.send(ctx, "POST", "/localapi/v0/tka/disable", 200, bytes.NewReader(secret)); err != nil {
-		return fmt.Errorf("error: %w", err)
-	}
-	return nil
-}
-
 // GetServeConfig return the current serve config.
 //
 // If the serve config is empty, it returns (nil, nil).
@@ -995,6 +995,29 @@ func getServeConfigFromJSON(body []byte) (sc *ipn.ServeConfig, err error) {
 		return nil, err
 	}
 	return sc, nil
+}
+
+// StreamFunnel returns an io.ReadCloser that streams serve/Funnel
+// connections made to the provided HostPort.
+//
+// If Funnel was not already enabled for the HostPort in the ServeConfig,
+// the backend enables it for the duration of the context's lifespan and
+// then turns it back off once the context is closed.
+// If Funnel was already enabled, the ServeConfig is untouched.
+func (lc *LocalClient) StreamFunnel(ctx context.Context, hp ipn.HostPort) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", "http://"+apitype.LocalAPIHost+"/localapi/v0/stream-funnel", jsonBody(hp))
+	if err != nil {
+		return nil, err
+	}
+	res, err := lc.doLocalRequestNiceError(req)
+	if err != nil {
+		return nil, err
+	}
+	if res.StatusCode != 200 {
+		res.Body.Close()
+		return nil, errors.New(res.Status)
+	}
+	return res.Body, nil
 }
 
 // tailscaledConnectHint gives a little thing about why tailscaled (or

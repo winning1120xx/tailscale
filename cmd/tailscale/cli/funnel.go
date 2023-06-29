@@ -7,6 +7,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strconv"
@@ -66,20 +67,20 @@ func (e *serveEnv) runFunnel(ctx context.Context, args []string) error {
 		return flag.ErrHelp
 	}
 
-	var on bool
+	var stream, on bool
 	switch args[1] {
+	case "stream":
+		if s := os.Getenv("TS_DEBUG_FUNNEL_STREAM"); s == "on" {
+			stream = true
+		} else {
+			return flag.ErrHelp
+		}
 	case "on", "off":
 		on = args[1] == "on"
 	default:
 		return flag.ErrHelp
 	}
-	sc, err := e.lc.GetServeConfig(ctx)
-	if err != nil {
-		return err
-	}
-	if sc == nil {
-		sc = new(ipn.ServeConfig)
-	}
+
 	st, err := e.getLocalClientStatus(ctx)
 	if err != nil {
 		return fmt.Errorf("getting client status: %w", err)
@@ -96,6 +97,25 @@ func (e *serveEnv) runFunnel(ctx context.Context, args []string) error {
 	}
 	dnsName := strings.TrimSuffix(st.Self.DNSName, ".")
 	hp := ipn.HostPort(dnsName + ":" + strconv.Itoa(int(port)))
+
+	if stream {
+		// In the streaming case, the process stays running in the
+		// foreground and prints out connections to the HostPort.
+		//
+		// The local backend handles updating the ServeConfig as
+		// necessary, then restores it to its original state once
+		// the process's context is closed or the client turns off
+		// Tailscale.
+		return e.streamFunnel(ctx, hp)
+	}
+
+	sc, err := e.lc.GetServeConfig(ctx)
+	if err != nil {
+		return err
+	}
+	if sc == nil {
+		sc = new(ipn.ServeConfig)
+	}
 	if on == sc.AllowFunnel[hp] {
 		printFunnelWarning(sc)
 		// Nothing to do.
@@ -115,6 +135,29 @@ func (e *serveEnv) runFunnel(ctx context.Context, args []string) error {
 	}
 	printFunnelWarning(sc)
 	return nil
+}
+
+func (e *serveEnv) streamFunnel(ctx context.Context, hp ipn.HostPort) error {
+	sc, err := e.lc.GetServeConfig(ctx)
+	if err != nil {
+		return err
+	}
+	if sc == nil {
+		sc = new(ipn.ServeConfig)
+	}
+	mak.Set(&sc.AllowFunnel, hp, true)
+	printFunnelWarning(sc)
+
+	stream, err := e.lc.StreamFunnel(ctx, hp)
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+
+	fmt.Fprintf(os.Stderr, "Funnel started on \"https://%s\".\n", hp)
+	fmt.Fprintf(os.Stderr, "Press Ctrl-C to stop Funnel.\n\n")
+	_, err = io.Copy(os.Stdout, stream)
+	return err
 }
 
 // printFunnelWarning prints a warning if the Funnel is on but there is no serve

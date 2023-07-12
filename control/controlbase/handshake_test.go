@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"tailscale.com/net/memnet"
+	"tailscale.com/tstest"
 	"tailscale.com/types/key"
 )
 
@@ -161,6 +162,7 @@ func (r *tamperReader) Read(bs []byte) (int, error) {
 }
 
 func TestTampering(t *testing.T) {
+	var clock = &tstest.Clock{}
 	// Tamper with every byte of the client initiation message.
 	for i := 0; i < 101; i++ {
 		var (
@@ -242,7 +244,7 @@ func TestTampering(t *testing.T) {
 
 		// The client needs a timeout if the tampering is hitting the length header.
 		if i == 1 || i == 2 {
-			client.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+			client.SetReadDeadline(clock.Now().Add(10 * time.Millisecond))
 		}
 
 		var bs [100]byte
@@ -270,7 +272,7 @@ func TestTampering(t *testing.T) {
 			var bs [100]byte
 			// The server needs a timeout if the tampering is hitting the length header.
 			if i == 1 || i == 2 {
-				server.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+				server.SetReadDeadline(clock.Now().Add(10 * time.Millisecond))
 			}
 			n, err := server.Read(bs[:])
 			if n != 0 {

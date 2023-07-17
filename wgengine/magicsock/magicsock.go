@@ -90,6 +90,8 @@ const (
 	socketBufferSize = 7 << 20
 )
 
+var clock = tstime.StdClock{}
+
 // useDerpRoute reports whether magicsock should enable the DERP
 // return path optimization (Issue 150).
 func useDerpRoute() bool {
@@ -396,7 +398,7 @@ type Conn struct {
 	// derpCleanupTimer is the timer that fires to occasionally clean
 	// up idle DERP connections. It's only used when there is a non-home
 	// DERP connection in use.
-	derpCleanupTimer *time.Timer
+	derpCleanupTimer tstime.TimerController
 
 	// derpCleanupTimerArmed is whether derpCleanupTimer is
 	// scheduled to fire within derpCleanStaleInterval.
@@ -404,7 +406,7 @@ type Conn struct {
 
 	// periodicReSTUNTimer, when non-nil, is an AfterFunc timer
 	// that will call Conn.doPeriodicSTUN.
-	periodicReSTUNTimer *time.Timer
+	periodicReSTUNTimer tstime.TimerController
 
 	// endpointsUpdateActive indicates that updateEndpoints is
 	// currently running. It's used to deduplicate concurrent endpoint
@@ -746,7 +748,7 @@ func (c *Conn) updateEndpoints(why string) {
 					if debugReSTUNStopOnIdle() {
 						c.logf("scheduling periodicSTUN to run in %v", d)
 					}
-					c.periodicReSTUNTimer = time.AfterFunc(d, c.doPeriodicSTUN)
+					c.periodicReSTUNTimer = clock.AfterFunc(d, c.doPeriodicSTUN)
 				}
 			} else {
 				if debugReSTUNStopOnIdle() {
@@ -810,7 +812,7 @@ func (c *Conn) setEndpoints(endpoints []tailcfg.Endpoint) (changed bool) {
 		return false
 	}
 
-	c.lastEndpointsTime = time.Now()
+	c.lastEndpointsTime = clock.Now()
 	for de, fn := range c.onEndpointRefreshed {
 		go fn()
 		delete(c.onEndpointRefreshed, de)
@@ -901,7 +903,7 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 	return report, nil
 }
 
-var processStartUnixNano = time.Now().UnixNano()
+var processStartUnixNano = clock.Now().UnixNano()
 
 // pickDERPFallback returns a non-zero but deterministic DERP node to
 // connect to.  This is only used if netcheck couldn't find the
@@ -1227,7 +1229,7 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 	// endpoints if they do actually time out without being rediscovered.
 	// For now, though, rely on a minor LinkChange event causing this to
 	// re-run.
-	eps = c.endpointTracker.update(time.Now(), eps)
+	eps = c.endpointTracker.update(clock.Now(), eps)
 
 	if localAddr := c.pconn4.LocalAddr(); localAddr.IP.IsUnspecified() {
 		ips, loopback, err := interfaces.LocalAddresses()
@@ -1530,7 +1532,7 @@ func (c *Conn) derpWriteChanOfAddr(addr netip.AddrPort, peer key.NodePublic) cha
 	// below when we have both.)
 	ad, ok := c.activeDerp[regionID]
 	if ok {
-		*ad.lastWrite = time.Now()
+		*ad.lastWrite = clock.Now()
 		c.setPeerLastDerpLocked(peer, regionID, regionID)
 		return ad.writeCh
 	}
@@ -1545,7 +1547,7 @@ func (c *Conn) derpWriteChanOfAddr(addr netip.AddrPort, peer key.NodePublic) cha
 		if r, ok := c.derpRoute[peer]; ok {
 			if ad, ok := c.activeDerp[r.derpID]; ok && ad.c == r.dc {
 				c.setPeerLastDerpLocked(peer, r.derpID, regionID)
-				*ad.lastWrite = time.Now()
+				*ad.lastWrite = clock.Now()
 				return ad.writeCh
 			}
 		}
@@ -1596,8 +1598,8 @@ func (c *Conn) derpWriteChanOfAddr(addr netip.AddrPort, peer key.NodePublic) cha
 	ad.writeCh = ch
 	ad.cancel = cancel
 	ad.lastWrite = new(time.Time)
-	*ad.lastWrite = time.Now()
-	ad.createTime = time.Now()
+	*ad.lastWrite = clock.Now()
+	ad.createTime = clock.Now()
 	c.activeDerp[regionID] = ad
 	metricNumDERPConns.Set(int64(len(c.activeDerp)))
 	c.logActiveDerpLocked()
@@ -1757,7 +1759,7 @@ func (c *Conn) runDerpReader(ctx context.Context, derpFakeAddr netip.AddrPort, d
 		}
 		bo.BackOff(ctx, nil) // reset
 
-		now := time.Now()
+		now := clock.Now()
 		if lastPacketTime.IsZero() || now.Sub(lastPacketTime) > 5*time.Second {
 			health.NoteDERPRegionReceivedFrame(regionID)
 			lastPacketTime = now
@@ -2240,7 +2242,7 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc ke
 	// Emit information about the disco frame into the pcap stream
 	// if a capture hook is installed.
 	if cb := c.captureHook.Load(); cb != nil {
-		cb(capture.PathDisco, time.Now(), discoPcapFrame(src, derpNodeSrc, payload), packet.CaptureMeta{})
+		cb(capture.PathDisco, clock.Now(), discoPcapFrame(src, derpNodeSrc, payload), packet.CaptureMeta{})
 	}
 
 	dm, err := disco.Parse(payload)
@@ -2352,9 +2354,9 @@ func (c *Conn) unambiguousNodeKeyOfPingLocked(dm *disco.Ping, dk key.DiscoPublic
 // di is the discoInfo of the source of the ping.
 // derpNodeSrc is non-zero if the ping arrived via DERP.
 func (c *Conn) handlePingLocked(dm *disco.Ping, src netip.AddrPort, di *discoInfo, derpNodeSrc key.NodePublic) {
-	likelyHeartBeat := src == di.lastPingFrom && time.Since(di.lastPingTime) < 5*time.Second
+	likelyHeartBeat := src == di.lastPingFrom && clock.Since(di.lastPingTime) < 5*time.Second
 	di.lastPingFrom = src
-	di.lastPingTime = time.Now()
+	di.lastPingTime = clock.Now()
 	isDerp := src.Addr() == derpMagicIPAddr
 
 	// If we can figure out with certainty which node key this disco
@@ -2446,7 +2448,7 @@ func (c *Conn) enqueueCallMeMaybe(derpAddr netip.AddrPort, de *endpoint) {
 		return
 	}
 
-	if !c.lastEndpointsTime.After(time.Now().Add(-endpointsFreshEnoughDuration)) {
+	if !c.lastEndpointsTime.After(clock.Now().Add(-endpointsFreshEnoughDuration)) {
 		c.dlogf("[v1] magicsock: want call-me-maybe but endpoints stale; restunning")
 
 		mak.Set(&c.onEndpointRefreshed, de, func() {
@@ -2910,7 +2912,7 @@ func (c *Conn) closeOrReconnectDERPLocked(regionID int, why string) {
 // It is the responsibility of the caller to call logActiveDerpLocked after any set of closes.
 func (c *Conn) closeDerpLocked(regionID int, why string) {
 	if ad, ok := c.activeDerp[regionID]; ok {
-		c.logf("magicsock: closing connection to derp-%v (%v), age %v", regionID, why, time.Since(ad.createTime).Round(time.Second))
+		c.logf("magicsock: closing connection to derp-%v (%v), age %v", regionID, why, clock.Since(ad.createTime).Round(time.Second))
 		go ad.c.Close()
 		ad.cancel()
 		delete(c.activeDerp, regionID)
@@ -2920,7 +2922,7 @@ func (c *Conn) closeDerpLocked(regionID int, why string) {
 
 // c.mu must be held.
 func (c *Conn) logActiveDerpLocked() {
-	now := time.Now()
+	now := clock.Now()
 	c.logf("magicsock: %v active derp conns%s", len(c.activeDerp), logger.ArgWriter(func(buf *bufio.Writer) {
 		if len(c.activeDerp) == 0 {
 			return
@@ -2979,7 +2981,7 @@ func (c *Conn) cleanStaleDerp() {
 	}
 	c.derpCleanupTimerArmed = false
 
-	tooOld := time.Now().Add(-derpInactiveCleanupTime)
+	tooOld := clock.Now().Add(-derpInactiveCleanupTime)
 	dirty := false
 	someNonHomeOpen := false
 	for i, ad := range c.activeDerp {
@@ -3012,7 +3014,7 @@ func (c *Conn) scheduleCleanStaleDerpLocked() {
 	if c.derpCleanupTimer != nil {
 		c.derpCleanupTimer.Reset(derpCleanStaleInterval)
 	} else {
-		c.derpCleanupTimer = time.AfterFunc(derpCleanStaleInterval, c.cleanStaleDerp)
+		c.derpCleanupTimer = clock.AfterFunc(derpCleanStaleInterval, c.cleanStaleDerp)
 	}
 }
 
@@ -4128,10 +4130,10 @@ type endpoint struct {
 	// mu protects all following fields.
 	mu sync.Mutex // Lock ordering: Conn.mu, then endpoint.mu
 
-	heartBeatTimer *time.Timer    // nil when idle
-	lastSend       mono.Time      // last time there was outgoing packets sent to this peer (from wireguard-go)
-	lastFullPing   mono.Time      // last time we pinged all disco endpoints
-	derpAddr       netip.AddrPort // fallback/bootstrap path, if non-zero (non-zero for well-behaved clients)
+	heartBeatTimer tstime.TimerController // nil when idle
+	lastSend       mono.Time              // last time there was outgoing packets sent to this peer (from wireguard-go)
+	lastFullPing   mono.Time              // last time we pinged all disco endpoints
+	derpAddr       netip.AddrPort         // fallback/bootstrap path, if non-zero (non-zero for well-behaved clients)
 
 	bestAddr           addrLatency // best non-DERP path; zero if none
 	bestAddrAt         mono.Time   // time best address re-confirmed
@@ -4257,7 +4259,7 @@ func (st *endpointState) shouldDeleteLocked() bool {
 		return st.index == indexSentinelDeleted
 	default:
 		// This was an endpoint discovered at runtime.
-		return time.Since(st.lastGotPing) > sessionActiveTimeout
+		return clock.Since(st.lastGotPing) > sessionActiveTimeout
 	}
 }
 
@@ -4272,14 +4274,14 @@ func (st *endpointState) latencyLocked() (lat time.Duration, ok bool) {
 
 func (de *endpoint) deleteEndpointLocked(why string, ep netip.AddrPort) {
 	de.debugUpdates.Add(EndpointChange{
-		When: time.Now(),
+		When: clock.Now(),
 		What: "deleteEndpointLocked-" + why,
 		From: ep,
 	})
 	delete(de.endpointState, ep)
 	if de.bestAddr.AddrPort == ep {
 		de.debugUpdates.Add(EndpointChange{
-			When: time.Now(),
+			When: clock.Now(),
 			What: "deleteEndpointLocked-bestAddr-" + why,
 			From: de.bestAddr,
 		})
@@ -4300,7 +4302,7 @@ type pongReply struct {
 type sentPing struct {
 	to      netip.AddrPort
 	at      mono.Time
-	timer   *time.Timer // timeout timer
+	timer   tstime.TimerController // timeout timer
 	purpose discoPingPurpose
 }
 
@@ -4467,7 +4469,7 @@ func (de *endpoint) heartbeat() {
 		de.sendDiscoPingsLocked(now, true)
 	}
 
-	de.heartBeatTimer = time.AfterFunc(heartbeatInterval, de.heartbeat)
+	de.heartBeatTimer = clock.AfterFunc(heartbeatInterval, de.heartbeat)
 }
 
 // wantFullPingLocked reports whether we should ping to all our peers looking for
@@ -4496,7 +4498,7 @@ func (de *endpoint) wantFullPingLocked(now mono.Time) bool {
 func (de *endpoint) noteActiveLocked() {
 	de.lastSend = mono.Now()
 	if de.heartBeatTimer == nil && !de.heartbeatDisabled {
-		de.heartBeatTimer = time.AfterFunc(heartbeatInterval, de.heartbeat)
+		de.heartBeatTimer = clock.AfterFunc(heartbeatInterval, de.heartbeat)
 	}
 }
 
@@ -4690,7 +4692,7 @@ func (de *endpoint) startDiscoPingLocked(ep netip.AddrPort, now mono.Time, purpo
 	de.sentPing[txid] = sentPing{
 		to:      ep,
 		at:      now,
-		timer:   time.AfterFunc(pingTimeoutDuration, func() { de.discoPingTimeout(txid) }),
+		timer:   clock.AfterFunc(pingTimeoutDuration, func() { de.discoPingTimeout(txid) }),
 		purpose: purpose,
 	}
 	logLevel := discoLog
@@ -4848,7 +4850,7 @@ func (de *endpoint) updateFromNode(n *tailcfg.Node, heartbeatDisabled bool) {
 			short: n.DiscoKey.ShortString(),
 		})
 		de.debugUpdates.Add(EndpointChange{
-			When: time.Now(),
+			When: clock.Now(),
 			What: "updateFromNode-resetLocked",
 		})
 		de.resetLocked()
@@ -4856,7 +4858,7 @@ func (de *endpoint) updateFromNode(n *tailcfg.Node, heartbeatDisabled bool) {
 	if n.DERP == "" {
 		if de.derpAddr.IsValid() {
 			de.debugUpdates.Add(EndpointChange{
-				When: time.Now(),
+				When: clock.Now(),
 				What: "updateFromNode-remove-DERP",
 				From: de.derpAddr,
 			})
@@ -4866,7 +4868,7 @@ func (de *endpoint) updateFromNode(n *tailcfg.Node, heartbeatDisabled bool) {
 		newDerp, _ := netip.ParseAddrPort(n.DERP)
 		if de.derpAddr != newDerp {
 			de.debugUpdates.Add(EndpointChange{
-				When: time.Now(),
+				When: clock.Now(),
 				What: "updateFromNode-DERP",
 				From: de.derpAddr,
 				To:   newDerp,
@@ -4899,7 +4901,7 @@ func (de *endpoint) updateFromNode(n *tailcfg.Node, heartbeatDisabled bool) {
 	}
 	if len(newIpps) > 0 {
 		de.debugUpdates.Add(EndpointChange{
-			When: time.Now(),
+			When: clock.Now(),
 			What: "updateFromNode-new-Endpoints",
 			To:   newIpps,
 		})
@@ -4937,14 +4939,14 @@ func (de *endpoint) addCandidateEndpoint(ep netip.AddrPort, forRxPingTxID stun.T
 			// Already-known endpoint from the network map.
 			return duplicatePing
 		}
-		st.lastGotPing = time.Now()
+		st.lastGotPing = clock.Now()
 		return duplicatePing
 	}
 
 	// Newly discovered endpoint. Exciting!
 	de.c.dlogf("[v1] magicsock: disco: adding %v as candidate endpoint for %v (%s)", ep, de.discoShort(), de.publicKey.ShortString())
 	de.endpointState[ep] = &endpointState{
-		lastGotPing:     time.Now(),
+		lastGotPing:     clock.Now(),
 		lastGotPingTxID: forRxPingTxID,
 	}
 
@@ -5030,7 +5032,7 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src netip
 		if betterAddr(thisPong, de.bestAddr) {
 			de.c.logf("magicsock: disco: node %v %v now using %v", de.publicKey.ShortString(), de.discoShort(), sp.to)
 			de.debugUpdates.Add(EndpointChange{
-				When: time.Now(),
+				When: clock.Now(),
 				What: "handlePingLocked-bestAddr-update",
 				From: de.bestAddr,
 				To:   thisPong,
@@ -5039,7 +5041,7 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src netip
 		}
 		if de.bestAddr.AddrPort == thisPong.AddrPort {
 			de.debugUpdates.Add(EndpointChange{
-				When: time.Now(),
+				When: clock.Now(),
 				What: "handlePingLocked-bestAddr-latency",
 				From: de.bestAddr,
 				To:   thisPong,
@@ -5168,7 +5170,7 @@ func (de *endpoint) handleCallMeMaybe(m *disco.CallMeMaybe) {
 	de.mu.Lock()
 	defer de.mu.Unlock()
 
-	now := time.Now()
+	now := clock.Now()
 	for ep := range de.isCallMeMaybeEP {
 		de.isCallMeMaybeEP[ep] = false // mark for deletion
 	}
@@ -5190,7 +5192,7 @@ func (de *endpoint) handleCallMeMaybe(m *disco.CallMeMaybe) {
 	}
 	if len(newEPs) > 0 {
 		de.debugUpdates.Add(EndpointChange{
-			When: time.Now(),
+			When: clock.Now(),
 			What: "handleCallMeMaybe-new-endpoints",
 			To:   newEPs,
 		})
@@ -5257,7 +5259,7 @@ func (de *endpoint) stopAndReset() {
 	}
 
 	de.debugUpdates.Add(EndpointChange{
-		When: time.Now(),
+		When: clock.Now(),
 		What: "stopAndReset-resetLocked",
 	})
 	de.resetLocked()

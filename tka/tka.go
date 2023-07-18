@@ -721,3 +721,86 @@ func (a *Authority) Compact(storage CompactableChonk, o CompactionOptions) error
 	a.oldestAncestor = ancestor
 	return nil
 }
+
+// findParentForRewrite finds the parent AUM to use when rewriting state to
+// retroactively remove trust in the specified keys.
+func (a *Authority) findParentForRewrite(storage Chonk, removeKeys []tkatype.KeyID) (AUMHash, error) {
+	cursor := a.Head()
+
+	for {
+		if cursor == a.oldestAncestor.Hash() {
+			// We've reached as far back in our history as we can,
+			// so we have to rewrite from here.
+			return a.oldestAncestor.Hash(), nil
+		}
+
+		aum, err := storage.AUM(cursor)
+		if err != nil {
+			return AUMHash{}, fmt.Errorf("reading AUM %v: %w", cursor, err)
+		}
+
+		// An ideal rewrite parent trusts neither key.
+		state, err := computeStateAt(storage, 2000, cursor)
+		if err != nil {
+			return AUMHash{}, fmt.Errorf("computing state for %v: %w", cursor, err)
+		}
+		keyTrusted := false
+		for _, key := range removeKeys {
+			if _, err := state.GetKey(key); err == nil {
+				keyTrusted = true
+			}
+		}
+		if !keyTrusted {
+			return cursor, nil // niether key was trusted! Huzzah!
+		}
+
+		parent, hasParent := aum.Parent()
+		if !hasParent {
+			// This is the genesis AUM, so we have to rewrite from here.
+			return aum.Hash(), nil
+		}
+		cursor = parent
+	}
+
+	panic("unreachable")
+}
+
+// MakeRetroactiveRevocation generates a forking update which revokes the specified keys, in
+// such a manner that any malicious use of those keys is erased.
+//
+// The generated AUM must be signed with more signatures than the sum of key votes that
+// were compromised, before being consumed by tka.Authority methods.
+func (a *Authority) MakeRetroactiveRevocation(storage Chonk, removeKeys []tkatype.KeyID) (*AUM, error) {
+	parent, err := a.findParentForRewrite(storage, removeKeys)
+	if err != nil {
+		return nil, fmt.Errorf("finding parent: %v", err)
+	}
+
+	// Construct the new state where the revoked keys are no longer trusted.
+	state := a.state.Clone()
+	for _, keyToRevoke := range removeKeys {
+		idx := -1
+		for i := range state.Keys {
+			keyID, err := state.Keys[i].ID()
+			if err != nil {
+				return nil, fmt.Errorf("computing keyID: %v", err)
+			}
+			if bytes.Equal(keyToRevoke, keyID) {
+				idx = i
+				break
+			}
+		}
+		if idx >= 0 {
+			state.Keys = append(state.Keys[:idx], state.Keys[idx+1:]...)
+		}
+	}
+	state.LastAUMHash = nil // checkpoints can't specify a LastAUMHash
+
+	forkingAUM := &AUM{
+		MessageKind: AUMCheckpoint,
+		State:       &state,
+		PrevAUMHash: parent[:],
+	}
+
+	return forkingAUM, forkingAUM.StaticValidate()
+}

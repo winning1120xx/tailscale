@@ -43,6 +43,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/ptr"
+	"tailscale.com/types/tkatype"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/httpm"
 	"tailscale.com/util/mak"
@@ -105,6 +106,9 @@ var handler = map[string]localAPIHandler{
 	"tka/affected-sigs":           (*Handler).serveTKAAffectedSigs,
 	"tka/wrap-preauth-key":        (*Handler).serveTKAWrapPreauthKey,
 	"tka/verify-deeplink":         (*Handler).serveTKAVerifySigningDeeplink,
+	"tka/generate-recovery-aum":   (*Handler).serveTKAGenerateRecoveryAUM,
+	"tka/cosign-recovery-aum":     (*Handler).serveTKACosignRecoveryAUM,
+	"tka/submit-recovery-aum":     (*Handler).serveTKASubmitRecoveryAUM,
 	"upload-client-metrics":       (*Handler).serveUploadClientMetrics,
 	"watch-ipn-bus":               (*Handler).serveWatchIPNBus,
 	"whois":                       (*Handler).serveWhoIs,
@@ -1743,6 +1747,94 @@ func (h *Handler) serveTKAAffectedSigs(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(j)
+}
+
+func (h *Handler) serveTKAGenerateRecoveryAUM(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "access denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != httpm.POST {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	type verifyRequest struct {
+		Keys []tkatype.KeyID
+	}
+	var req verifyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON for verifyRequest body", http.StatusBadRequest)
+		return
+	}
+
+	res, err := h.b.NetworkLockGenerateRecoveryAUM(req.Keys)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(res.Serialize())
+}
+
+func (h *Handler) serveTKACosignRecoveryAUM(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "access denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != httpm.POST {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body := io.LimitReader(r.Body, 1024*1024)
+	aumBytes, err := ioutil.ReadAll(body)
+	if err != nil {
+		http.Error(w, "reading AUM", http.StatusBadRequest)
+		return
+	}
+	var aum tka.AUM
+	if err := aum.Unserialize(aumBytes); err != nil {
+		http.Error(w, "decoding AUM", http.StatusBadRequest)
+		return
+	}
+
+	res, err := h.b.NetworkLockCosignRecoveryAUM(&aum)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(res.Serialize())
+}
+
+func (h *Handler) serveTKASubmitRecoveryAUM(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "access denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != httpm.POST {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body := io.LimitReader(r.Body, 1024*1024)
+	aumBytes, err := ioutil.ReadAll(body)
+	if err != nil {
+		http.Error(w, "reading AUM", http.StatusBadRequest)
+		return
+	}
+	var aum tka.AUM
+	if err := aum.Unserialize(aumBytes); err != nil {
+		http.Error(w, "decoding AUM", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.b.NetworkLockSubmitRecoveryAUM(&aum); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 // serveProfiles serves profile switching-related endpoints. Supported methods

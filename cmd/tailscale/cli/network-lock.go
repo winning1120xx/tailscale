@@ -23,6 +23,7 @@ import (
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tka"
 	"tailscale.com/types/key"
+	"tailscale.com/types/tkatype"
 )
 
 var netlockCmd = &ffcli.Command{
@@ -40,6 +41,7 @@ var netlockCmd = &ffcli.Command{
 		nlDisablementKDFCmd,
 		nlLogCmd,
 		nlLocalDisableCmd,
+		nlRecoverKeyCmd,
 	},
 	Exec: runNetworkLockNoSubcommand,
 }
@@ -709,5 +711,94 @@ func wrapAuthKey(ctx context.Context, keyStr string, status *ipnstate.Status) er
 	}
 
 	fmt.Println(wrapped)
+	return nil
+}
+
+var nlRecoverKeyArgs struct {
+	cosign bool
+	finish bool
+}
+
+var nlRecoverKeyCmd = &ffcli.Command{
+	Name:       "recover-compromised-key",
+	ShortUsage: "recover-compromised-key <tailnet-lock-key>... or recover-compromised-key [--cosign] [--finish] <recovery-blob>",
+	ShortHelp:  "Recovers from a compromised tailnet-lock key",
+	LongHelp: `Retroactively revokes trust in the specified keys, erasing any trust in those keys and preventing them from being used in the future.
+
+Start the process by running: tailscale recover-compromised-key <keys>, where keys is the list of compromised tailnet-lock keys.
+
+The outputted command will then need to be run on other devices with trusted tailnet-lock keys to co-sign the recovery blob.
+The latest-outputted from each cosign command should be used each time.
+
+Once the command has been run on more devices than keys were compromised, the final outputted command can be run again with the --finish flag.`,
+	Exec: runNetworkLockRecoverKey,
+	FlagSet: (func() *flag.FlagSet {
+		fs := newFlagSet("lock recover-compromised-key")
+		fs.BoolVar(&nlRecoverKeyArgs.cosign, "cosign", false, "continue generating the recovery using the tailnet lock key on this device and the provided recovery blob")
+		fs.BoolVar(&nlRecoverKeyArgs.finish, "finish", false, "finish the recovery process by transmitting the revocation")
+		return fs
+	})(),
+}
+
+func runNetworkLockRecoverKey(ctx context.Context, args []string) error {
+	// First step in the process
+	if !nlRecoverKeyArgs.cosign && !nlRecoverKeyArgs.finish {
+		removeKeys, _, err := parseNLArgs(args, true, false)
+		if err != nil {
+			return err
+		}
+
+		keyIDs := make([]tkatype.KeyID, len(removeKeys))
+		for i, k := range removeKeys {
+			keyIDs[i], err = k.ID()
+			if err != nil {
+				return fmt.Errorf("generating keyID: %v", err)
+			}
+		}
+
+		aumBytes, err := localClient.NetworkLockGenRecoveryAUM(ctx, keyIDs)
+		if err != nil {
+			return fmt.Errorf("generation of recovery AUM failed: %w", err)
+		}
+
+		fmt.Printf(`Run the following command on another machine with a trusted tailnet lock key:
+	%s lock recover-compromised-key --cosign %X
+`, os.Args[0], aumBytes)
+		return nil
+	}
+
+	// If we got this far, we need to co-sign the AUM and/or transmit it for distribution.
+	b, err := hex.DecodeString(args[0])
+	if err != nil {
+		return fmt.Errorf("parsing hex: %v", err)
+	}
+	var recoveryAUM tka.AUM
+	if err := recoveryAUM.Unserialize(b); err != nil {
+		return fmt.Errorf("decoding recovery AUM: %v", err)
+	}
+
+	if nlRecoverKeyArgs.cosign {
+		aumBytes, err := localClient.NetworkLockCosignRecoveryAUM(ctx, recoveryAUM)
+		if err != nil {
+			return fmt.Errorf("co-signing recovery AUM failed: %w", err)
+		}
+
+		fmt.Printf(`Co-signing completed successfully.
+
+To accumulate an additional signature, run the following command on another machine with a trusted tailnet lock key:
+	%s lock recover-compromised-key --cosign %X
+
+Alternatively if you are done with co-signing, complete recovery by running the following command:
+	%s lock recover-compromised-key --finish %X
+`, os.Args[0], aumBytes, os.Args[0], aumBytes)
+	}
+
+	if nlRecoverKeyArgs.finish {
+		if err := localClient.NetworkLockSubmitRecoveryAUM(ctx, recoveryAUM); err != nil {
+			return fmt.Errorf("submitting recovery AUM failed: %w", err)
+		}
+		fmt.Println("Recovery completed.")
+	}
+
 	return nil
 }

@@ -22,6 +22,7 @@ import (
 
 	"tailscale.com/health"
 	"tailscale.com/net/dns/resolvconffile"
+	"tailscale.com/tstime"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/version/distro"
@@ -31,6 +32,8 @@ const (
 	backupConf = "/etc/resolv.pre-tailscale-backup.conf"
 	resolvConf = "/etc/resolv.conf"
 )
+
+var clock = tstime.StdClock{}
 
 // writeResolvConf writes DNS configuration in resolv.conf format to the given writer.
 func writeResolvConf(w io.Writer, servers []netip.Addr, domains []dnsname.FQDN) error {
@@ -392,9 +395,9 @@ func (m *directManager) SetDNS(config OSConfig) (err error) {
 	// cause a disruptive DNS outage each time we reset an empty
 	// OS configuration.
 	if changed && isResolvedRunning() && !runningAsGUIDesktopUser() {
-		t0 := time.Now()
+		t0 := clock.Now()
 		err := restartResolved()
-		d := time.Since(t0).Round(time.Millisecond)
+		d := clock.Since(t0).Round(time.Millisecond)
 		if err != nil {
 			m.logf("error restarting resolved after %v: %v", d, err)
 		} else {

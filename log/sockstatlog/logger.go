@@ -116,6 +116,7 @@ func NewLogger(logdir string, logf logger.Logf, logID logid.PublicID, netMon *ne
 		return nil, err
 	}
 
+	// This should be disabled per TS_NO_LOGS_NO_SUPPORT/NoLogsNoSupport()
 	logger := &Logger{
 		logf:  logf,
 		filch: filch,

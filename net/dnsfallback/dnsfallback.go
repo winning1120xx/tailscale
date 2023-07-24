@@ -109,6 +109,10 @@ func lookup(ctx context.Context, host string, logf logger.Logf, netMon *netmon.M
 		return []netip.Addr{ip}, nil
 	}
 
+	if true {
+		return nil, fmt.Errorf("no DNS fallback candidates remain for %q", host)
+	}
+
 	type nameIP struct {
 		dnsName string
 		ip      netip.Addr

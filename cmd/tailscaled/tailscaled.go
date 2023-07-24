@@ -342,7 +342,9 @@ func run() error {
 	}
 	sys.Set(netMon)
 
+	// This sets up the default logger again even though we created a fake one earlier
 	pol := logpolicy.New(logtail.CollectionNode, netMon, nil /* use log.Printf */)
+
 	pol.SetVerbosityLevel(args.verbose)
 	logPol = pol
 	defer func() {

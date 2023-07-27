@@ -87,7 +87,25 @@ const (
 	// is the max supported by a default configuration of macOS. Some platforms
 	// will silently clamp the value.
 	socketBufferSize = 7 << 20
+
+	// Various things needed to calculate the effective MTU
+	udpHeaderLen = 8 // Not defined anywhere unlike IP header length
+	// Disco header
+	discoHeaderLen = len(disco.Magic) + key.DiscoPublicRawLen
+	boxHeaderLen   = 40 // Header added by encrypting the naclbox
 )
+
+// Pad the content of the message to get the requested on-the-wire
+// packet size.  We have to include the padding as part of the
+// encrypted message or it gets truncated. So calculate the total
+// message size and subtract all the various headers.
+//
+// Parts of a packet:
+// IP header
+// UDP header
+// disco header
+// encryption overhead
+// message contents
 
 // useDerpRoute reports whether magicsock should enable the DERP
 // return path optimization (Issue 150).
@@ -1006,7 +1024,7 @@ func (c *Conn) LastRecvActivityOfNodeKey(nk key.NodePublic) string {
 }
 
 // Ping handles a "tailscale ping" CLI query.
-func (c *Conn) Ping(peer *tailcfg.Node, res *ipnstate.PingResult, cb func(*ipnstate.PingResult)) {
+func (c *Conn) Ping(peer *tailcfg.Node, res *ipnstate.PingResult, cb func(*ipnstate.PingResult), mtu int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.privateKey.IsZero() {
@@ -1030,7 +1048,7 @@ func (c *Conn) Ping(peer *tailcfg.Node, res *ipnstate.PingResult, cb func(*ipnst
 		cb(res)
 		return
 	}
-	ep.cliPing(res, cb)
+	ep.cliPing(res, cb, mtu)
 }
 
 // c.mu must be held
@@ -2061,7 +2079,7 @@ var debugIPv4DiscoPingPenalty = envknob.RegisterDuration("TS_DISCO_PONG_IPV4_DEL
 //
 // The dstKey should only be non-zero if the dstDisco key
 // unambiguously maps to exactly one peer.
-func (c *Conn) sendDiscoMessage(dst netip.AddrPort, dstKey key.NodePublic, dstDisco key.DiscoPublic, m disco.Message, logLevel discoLogLevel) (sent bool, err error) {
+func (c *Conn) sendDiscoMessage(dst netip.AddrPort, dstKey key.NodePublic, dstDisco key.DiscoPublic, m disco.Message, logLevel discoLogLevel, mtu int) (sent bool, err error) {
 	isDERP := dst.Addr() == derpMagicIPAddr
 	if _, isPong := m.(*disco.Pong); isPong && !isDERP && dst.Addr().Is4() {
 		time.Sleep(debugIPv4DiscoPingPenalty())
@@ -2076,9 +2094,15 @@ func (c *Conn) sendDiscoMessage(dst netip.AddrPort, dstKey key.NodePublic, dstDi
 	if _, err := crand.Read(nonce[:]); err != nil {
 		panic(err) // worth dying for
 	}
-	pkt := make([]byte, 0, 512) // TODO: size it correctly? pool? if it matters.
+
+	bufSize := 512
+	if mtu != 0 {
+		bufSize = mtu
+	}
+	pkt := make([]byte, 0, bufSize)
 	pkt = append(pkt, disco.Magic...)
 	pkt = c.discoPublic.AppendTo(pkt)
+	magic_pub := len(pkt)
 	di := c.discoInfoLocked(dstDisco)
 	c.mu.Unlock()
 
@@ -2088,7 +2112,18 @@ func (c *Conn) sendDiscoMessage(dst netip.AddrPort, dstKey key.NodePublic, dstDi
 		metricSendDiscoUDP.Add(1)
 	}
 
-	box := di.sharedKey.Seal(m.AppendMarshal(nil))
+	pm := m.AppendMarshal(nil)
+
+	if mtu != 0 {
+		ipHeaderLen := ipv4.HeaderLen
+		if dst.Addr().Is6() {
+			ipHeaderLen = ipv6.HeaderLen
+		}
+		pad := mtu - (ipHeaderLen + udpHeaderLen + magic_pub + boxHeaderLen + len(pm))
+		// Extend our buffer to the padded size
+		pm = append(pm, make([]byte, pad, pad)...)
+	}
+	box := di.sharedKey.Seal(pm)
 	pkt = append(pkt, box...)
 	sent, err = c.sendAddr(dst, dstKey, pkt)
 	if sent {
@@ -2097,7 +2132,7 @@ func (c *Conn) sendDiscoMessage(dst netip.AddrPort, dstKey key.NodePublic, dstDi
 			if !dstKey.IsZero() {
 				node = dstKey.ShortString()
 			}
-			c.dlogf("[v1] magicsock: disco: %v->%v (%v, %v) sent %v", c.discoShort, dstDisco.ShortString(), node, derpStr(dst.String()), disco.MessageSummary(m))
+			c.logf("magicsock: disco: %v->%v (%v, %v) sent %v len %v\n", c.discoShort, dstDisco.ShortString(), node, derpStr(dst.String()), disco.MessageSummary(m), len(pkt))
 		}
 		if isDERP {
 			metricSentDiscoDERP.Add(1)
@@ -2167,24 +2202,24 @@ const (
 //   - senderDiscoPubKey [32]byte
 //   - nonce             [24]byte
 //   - naclbox of payload (see tailscale.com/disco package for inner payload format)
+//   - optionally, zero padding to test out the MTU
 //
 // For messages received over DERP, the src.Addr() will be derpMagicIP (with
 // src.Port() being the region ID) and the derpNodeSrc will be the node key
 // it was received from at the DERP layer. derpNodeSrc is zero when received
 // over UDP.
 func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc key.NodePublic, via discoRXPath) (isDiscoMsg bool) {
-	const headerLen = len(disco.Magic) + key.DiscoPublicRawLen
-	if len(msg) < headerLen || string(msg[:len(disco.Magic)]) != disco.Magic {
+	msgLen := len(msg)
+	if msgLen < discoHeaderLen || string(msg[:len(disco.Magic)]) != disco.Magic {
 		return false
 	}
-
 	// If the first four parts are the prefix of disco.Magic
 	// (0x5453f09f) then it's definitely not a valid WireGuard
 	// packet (which starts with little-endian uint32 1, 2, 3, 4).
 	// Use naked returns for all following paths.
 	isDiscoMsg = true
 
-	sender := key.DiscoPublicFromRaw32(mem.B(msg[len(disco.Magic):headerLen]))
+	sender := key.DiscoPublicFromRaw32(mem.B(msg[len(disco.Magic):discoHeaderLen]))
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2193,7 +2228,7 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc ke
 		return
 	}
 	if debugDisco() {
-		c.logf("magicsock: disco: got disco-looking frame from %v via %s", sender.ShortString(), via)
+		c.logf("magicsock: disco: got disco-looking frame from %v via %s len %v", sender.ShortString(), via, msgLen)
 	}
 	if c.privateKey.IsZero() {
 		// Ignore disco messages when we're stopped.
@@ -2216,7 +2251,7 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc ke
 
 	di := c.discoInfoLocked(sender)
 
-	sealedBox := msg[headerLen:]
+	sealedBox := msg[discoHeaderLen:]
 	payload, ok := di.sharedKey.Open(sealedBox)
 	if !ok {
 		// This might be have been intended for a previous
@@ -2266,14 +2301,14 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc ke
 	switch dm := dm.(type) {
 	case *disco.Ping:
 		metricRecvDiscoPing.Add(1)
-		c.handlePingLocked(dm, src, di, derpNodeSrc)
+		c.handlePingLocked(dm, src, di, derpNodeSrc, msgLen)
 	case *disco.Pong:
 		metricRecvDiscoPong.Add(1)
 		// There might be multiple nodes for the sender's DiscoKey.
 		// Ask each to handle it, stopping once one reports that
 		// the Pong's TxID was theirs.
 		c.peerMap.forEachEndpointWithDiscoKey(sender, func(ep *endpoint) (keepGoing bool) {
-			if ep.handlePongConnLocked(dm, di, src) {
+			if ep.handlePongConnLocked(dm, di, src, msgLen) {
 				return false
 			}
 			return true
@@ -2350,7 +2385,8 @@ func (c *Conn) unambiguousNodeKeyOfPingLocked(dm *disco.Ping, dk key.DiscoPublic
 
 // di is the discoInfo of the source of the ping.
 // derpNodeSrc is non-zero if the ping arrived via DERP.
-func (c *Conn) handlePingLocked(dm *disco.Ping, src netip.AddrPort, di *discoInfo, derpNodeSrc key.NodePublic) {
+// msgLen is the length of the disco message
+func (c *Conn) handlePingLocked(dm *disco.Ping, src netip.AddrPort, di *discoInfo, derpNodeSrc key.NodePublic, msgLen int) {
 	likelyHeartBeat := src == di.lastPingFrom && time.Since(di.lastPingTime) < 5*time.Second
 	di.lastPingFrom = src
 	di.lastPingTime = time.Now()
@@ -2379,16 +2415,36 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src netip.AddrPort, di *discoInf
 	// Remember this route if not present.
 	var numNodes int
 	var dup bool
+	// Find the on-the-wire MTU. In this case, msgLen is the
+	// length of the entire disco packet, so everything except the
+	// IP and UDP headers.
+	mtu := 0
+	// msgLen for an ordinary ping is 124
+	// IPv4: 20
+	// UDP: 8
+	// Disco header: 38
+	// boxHeaderLen: 40
+	// PingLen: 44
+	// Type/version: 2
+	if msgLen > discoHeaderLen+boxHeaderLen+disco.PingLen+2 {
+		pad := ipv4.HeaderLen
+		if src.Addr().Is6() {
+			pad = ipv6.HeaderLen
+		}
+		pad += udpHeaderLen
+		mtu = msgLen + pad
+		c.logf("adding %v bytes to msgLen %v for mtu %v", pad, msgLen, mtu)
+	}
 	if isDerp {
 		if ep, ok := c.peerMap.endpointForNodeKey(derpNodeSrc); ok {
-			if ep.addCandidateEndpoint(src, dm.TxID) {
+			if ep.addCandidateEndpoint(src, dm.TxID, 0) {
 				return
 			}
 			numNodes = 1
 		}
 	} else {
 		c.peerMap.forEachEndpointWithDiscoKey(di.discoKey, func(ep *endpoint) (keepGoing bool) {
-			if ep.addCandidateEndpoint(src, dm.TxID) {
+			if ep.addCandidateEndpoint(src, dm.TxID, mtu) {
 				dup = true
 				return false
 			}
@@ -2426,7 +2482,7 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src netip.AddrPort, di *discoInf
 	go c.sendDiscoMessage(ipDst, dstKey, discoDest, &disco.Pong{
 		TxID: dm.TxID,
 		Src:  src,
-	}, discoVerboseLog)
+	}, discoVerboseLog, mtu)
 }
 
 // enqueueCallMeMaybe schedules a send of disco.CallMeMaybe to de via derpAddr
@@ -2468,12 +2524,12 @@ func (c *Conn) enqueueCallMeMaybe(derpAddr netip.AddrPort, de *endpoint) {
 	for _, ep := range c.lastEndpoints {
 		eps = append(eps, ep.Addr)
 	}
-	go de.c.sendDiscoMessage(derpAddr, de.publicKey, epDisco.key, &disco.CallMeMaybe{MyNumber: eps}, discoLog)
+	go de.c.sendDiscoMessage(derpAddr, de.publicKey, epDisco.key, &disco.CallMeMaybe{MyNumber: eps}, discoLog, 0)
 	if debugSendCallMeUnknownPeer() {
 		// Send a callMeMaybe packet to a non-existent peer
 		unknownKey := key.NewNode().Public()
 		c.logf("magicsock: sending CallMeMaybe to unknown peer per TS_DEBUG_SEND_CALLME_UNKNOWN_PEER")
-		go de.c.sendDiscoMessage(derpAddr, unknownKey, epDisco.key, &disco.CallMeMaybe{MyNumber: eps}, discoLog)
+		go de.c.sendDiscoMessage(derpAddr, unknownKey, epDisco.key, &disco.CallMeMaybe{MyNumber: eps}, discoLog, 0)
 	}
 }
 
@@ -3339,6 +3395,8 @@ func (c *Conn) bindSocket(ruc *RebindingUDPConn, network string, curPortFate cur
 			err = setDontFragment(pconn, network)
 			if err != nil {
 				c.logf("magicsock: unable to do path mtu discovery: %v", err)
+			} else {
+				c.logf("magicsock: peer MTU discovery enabled")
 			}
 		}
 
@@ -4140,7 +4198,7 @@ type endpoint struct {
 	lastFullPing   mono.Time      // last time we pinged all disco endpoints
 	derpAddr       netip.AddrPort // fallback/bootstrap path, if non-zero (non-zero for well-behaved clients)
 
-	bestAddr           addrLatency // best non-DERP path; zero if none
+	bestAddr           addrQuality // best non-DERP path; zero if none
 	bestAddrAt         mono.Time   // time best address re-confirmed
 	trustBestAddrUntil mono.Time   // time when bestAddr expires
 	sentPing           map[stun.TxID]sentPing
@@ -4248,6 +4306,7 @@ type endpointState struct {
 	recentPong  uint16      // index into recentPongs of most recent; older before, wrapped
 
 	index int16 // index in nodecfg.Node.Endpoints; meaningless if lastGotPing non-zero
+	mtu   int   // mtu of connection to this endpoint
 }
 
 // indexSentinelDeleted is the temporary value that endpointState.index takes while
@@ -4290,11 +4349,13 @@ func (de *endpoint) deleteEndpointLocked(why string, ep netip.AddrPort) {
 			What: "deleteEndpointLocked-bestAddr-" + why,
 			From: de.bestAddr,
 		})
-		de.bestAddr = addrLatency{}
+		de.bestAddr = addrQuality{}
 	}
 }
 
 // pongHistoryCount is how many pongReply values we keep per endpointState
+// XXX should maybe make this bigger for mtu stuff
+// const pongHistoryCount = 64 * len(usefulMtus)
 const pongHistoryCount = 64
 
 type pongReply struct {
@@ -4302,6 +4363,7 @@ type pongReply struct {
 	pongAt  mono.Time      // when we received the pong
 	from    netip.AddrPort // the pong's src (usually same as endpoint map key)
 	pongSrc netip.AddrPort // what they reported they heard
+	mtu     int            // total packet size including IP header
 }
 
 type sentPing struct {
@@ -4309,6 +4371,7 @@ type sentPing struct {
 	at      mono.Time
 	timer   *time.Timer // timeout timer
 	purpose discoPingPurpose
+	mtu     int // total packet size including IP header
 }
 
 // initFakeUDPAddr populates fakeWGAddr with a globally unique fake UDPAddr.
@@ -4513,7 +4576,7 @@ func (de *endpoint) noteActiveLocked() {
 
 // cliPing starts a ping for the "tailscale ping" command. res is value to call cb with,
 // already partially filled.
-func (de *endpoint) cliPing(res *ipnstate.PingResult, cb func(*ipnstate.PingResult)) {
+func (de *endpoint) cliPing(res *ipnstate.PingResult, cb func(*ipnstate.PingResult), mtu int) {
 	de.mu.Lock()
 	defer de.mu.Unlock()
 
@@ -4535,10 +4598,10 @@ func (de *endpoint) cliPing(res *ipnstate.PingResult, cb func(*ipnstate.PingResu
 		// Otherwise "tailscale ping" results to a node on the local network
 		// can look like they're bouncing between, say 10.0.0.0/9 and the peer's
 		// IPv6 address, both 1ms away, and it's random who replies first.
-		de.startDiscoPingLocked(udpAddr, now, pingCLI)
+		de.startDiscoPingLockedMTU(udpAddr, now, pingCLI, mtu)
 	} else {
 		for ep := range de.endpointState {
-			de.startDiscoPingLocked(ep, now, pingCLI)
+			de.startDiscoPingLockedMTU(ep, now, pingCLI, mtu)
 		}
 	}
 	de.noteActiveLocked()
@@ -4650,11 +4713,11 @@ func (de *endpoint) removeSentDiscoPingLocked(txid stun.TxID, sp sentPing) {
 //
 // The caller should use de.discoKey as the discoKey argument.
 // It is passed in so that sendDiscoPing doesn't need to lock de.mu.
-func (de *endpoint) sendDiscoPing(ep netip.AddrPort, discoKey key.DiscoPublic, txid stun.TxID, logLevel discoLogLevel) {
+func (de *endpoint) sendDiscoPing(ep netip.AddrPort, discoKey key.DiscoPublic, txid stun.TxID, logLevel discoLogLevel, mtu int) {
 	sent, _ := de.c.sendDiscoMessage(ep, de.publicKey, discoKey, &disco.Ping{
 		TxID:    [12]byte(txid),
 		NodeKey: de.c.publicKeyAtomic.Load(),
-	}, logLevel)
+	}, logLevel, mtu)
 	if !sent {
 		de.forgetDiscoPing(txid)
 	}
@@ -4679,6 +4742,10 @@ const (
 )
 
 func (de *endpoint) startDiscoPingLocked(ep netip.AddrPort, now mono.Time, purpose discoPingPurpose) {
+	de.startDiscoPingLockedMTU(ep, now, purpose, 0)
+}
+
+func (de *endpoint) startDiscoPingLockedMTU(ep netip.AddrPort, now mono.Time, purpose discoPingPurpose, mtu int) {
 	if runtime.GOOS == "js" {
 		return
 	}
@@ -4703,12 +4770,13 @@ func (de *endpoint) startDiscoPingLocked(ep netip.AddrPort, now mono.Time, purpo
 		at:      now,
 		timer:   time.AfterFunc(pingTimeoutDuration, func() { de.discoPingTimeout(txid) }),
 		purpose: purpose,
+		mtu:     mtu,
 	}
 	logLevel := discoLog
 	if purpose == pingHeartbeat {
 		logLevel = discoVerboseLog
 	}
-	go de.sendDiscoPing(ep, epDisco.key, txid, logLevel)
+	go de.sendDiscoPing(ep, epDisco.key, txid, logLevel, mtu)
 }
 
 func (de *endpoint) sendDiscoPingsLocked(now mono.Time, sendCallMeMaybe bool) {
@@ -4732,8 +4800,20 @@ func (de *endpoint) sendDiscoPingsLocked(now mono.Time, sendCallMeMaybe bool) {
 		if firstPing && sendCallMeMaybe {
 			de.c.dlogf("[v1] magicsock: disco: send, starting discovery for %v (%v)", de.publicKey.ShortString(), de.discoShort())
 		}
-
-		de.startDiscoPingLocked(ep, now, pingDiscovery)
+		// Send a bouquet of pings in different sizes to probe
+		// peer mtu, but only if this is not a derp addr.
+		if de.derpAddr.IsValid() {
+			de.startDiscoPingLocked(ep, now, pingDiscovery)
+		} else {
+			for _, mtu := range usefulMtus {
+				// XXX only send pings less than the mtu of the interface used to reach this endpoint
+				de.startDiscoPingLockedMTU(ep, now, pingDiscovery, mtu)
+				// XXX Would be nice to pause a bit to
+				// give the largest mtu an advantage
+				// in returning first, but we're
+				// holding a lock here.
+			}
+		}
 	}
 	derpAddr := de.derpAddr
 	if sentAny && sendCallMeMaybe && derpAddr.IsValid() {
@@ -4935,14 +5015,22 @@ func (de *endpoint) updateFromNode(n *tailcfg.Node, heartbeatDisabled bool) {
 //
 // This is called once we've already verified that we got a valid
 // discovery message from de via ep.
-func (de *endpoint) addCandidateEndpoint(ep netip.AddrPort, forRxPingTxID stun.TxID) (duplicatePing bool) {
+func (de *endpoint) addCandidateEndpoint(ep netip.AddrPort, forRxPingTxID stun.TxID, mtu int) (duplicatePing bool) {
 	de.mu.Lock()
 	defer de.mu.Unlock()
 
+	// lookup the current end point state
 	if st, ok := de.endpointState[ep]; ok {
+		// oh, we already have this endpoint in our list!
+		// check to see if this is a resend of the same ping as the one we got most recently
 		duplicatePing = forRxPingTxID == st.lastGotPingTxID
 		if !duplicatePing {
 			st.lastGotPingTxID = forRxPingTxID
+		}
+		// If this ping has a higher mtu, update it in the endpoint
+		if mtu > st.mtu {
+			de.c.logf("magicsock: updating MTU to %v for peer %v", mtu, de.discoShort())
+			st.mtu = mtu
 		}
 		if st.lastGotPing.IsZero() {
 			// Already-known endpoint from the network map.
@@ -4953,10 +5041,12 @@ func (de *endpoint) addCandidateEndpoint(ep netip.AddrPort, forRxPingTxID stun.T
 	}
 
 	// Newly discovered endpoint. Exciting!
-	de.c.dlogf("[v1] magicsock: disco: adding %v as candidate endpoint for %v (%s)", ep, de.discoShort(), de.publicKey.ShortString())
+	de.c.dlogf("[v1] magicsock: disco: adding %v as candidate endpoint for %v (%s) mtu %v", ep, de.discoShort(), de.publicKey.ShortString(), mtu)
+	// Currently this adds a separate endpoint for each test MTU, would be better to update in place
 	de.endpointState[ep] = &endpointState{
 		lastGotPing:     time.Now(),
 		lastGotPingTxID: forRxPingTxID,
+		mtu:             mtu,
 	}
 
 	// If for some reason this gets very large, do some cleanup.
@@ -4986,7 +5076,9 @@ func (de *endpoint) noteConnectivityChange() {
 // It should be called with the Conn.mu held.
 //
 // It reports whether m.TxID corresponds to a ping that this endpoint sent.
-func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src netip.AddrPort) (knownTxID bool) {
+//
+// msgLen is the length of the original encrypted disco message.
+func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src netip.AddrPort, msgLen int) (knownTxID bool) {
 	de.mu.Lock()
 	defer de.mu.Unlock()
 
@@ -4998,6 +5090,20 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src netip
 		return false
 	}
 	knownTxID = true // for naked returns below
+
+	mtu := 0
+	// Add 2 bytes for the type/version added to the disco message
+	if msgLen > discoHeaderLen+boxHeaderLen+disco.PongLen+2 {
+		pad := ipv4.HeaderLen
+		if src.Addr().Is6() {
+			pad = ipv6.HeaderLen
+		}
+		pad += udpHeaderLen
+		mtu = msgLen + pad
+	}
+	if sp.mtu != mtu {
+		de.c.logf("error! pong mtu %v does not match sent ping mtu %v", mtu, sp.mtu)
+	}
 	de.removeSentDiscoPingLocked(m.TxID, sp)
 
 	now := mono.Now()
@@ -5017,15 +5123,16 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src netip
 			pongAt:  now,
 			from:    src,
 			pongSrc: m.Src,
+			mtu:     mtu,
 		})
 	}
 
 	if sp.purpose != pingHeartbeat {
-		de.c.dlogf("[v1] magicsock: disco: %v<-%v (%v, %v)  got pong tx=%x latency=%v pong.src=%v%v", de.c.discoShort, de.discoShort(), de.publicKey.ShortString(), src, m.TxID[:6], latency.Round(time.Millisecond), m.Src, logger.ArgWriter(func(bw *bufio.Writer) {
+		de.c.dlogf("[v1] magicsock: disco: %v<-%v (%v, %v)  got pong tx=%x latency=%v pong.src=%v%v mtu %v", de.c.discoShort, de.discoShort(), de.publicKey.ShortString(), src, m.TxID[:6], latency.Round(time.Millisecond), m.Src, logger.ArgWriter(func(bw *bufio.Writer) {
 			if sp.to != src {
 				fmt.Fprintf(bw, " ping.to=%v", sp.to)
 			}
-		}))
+		}), mtu)
 	}
 
 	for _, pp := range de.pendingCLIPings {
@@ -5037,9 +5144,9 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src netip
 	// Promote this pong response to our current best address if it's lower latency.
 	// TODO(bradfitz): decide how latency vs. preference order affects decision
 	if !isDerp {
-		thisPong := addrLatency{sp.to, latency}
+		thisPong := addrQuality{sp.to, latency, mtu}
 		if betterAddr(thisPong, de.bestAddr) {
-			de.c.logf("magicsock: disco: node %v %v now using %v", de.publicKey.ShortString(), de.discoShort(), sp.to)
+			de.c.logf("UPDATING MTU magicsock: disco: node %v %v now using %v mtu %v", de.publicKey.ShortString(), de.discoShort(), sp.to, mtu)
 			de.debugUpdates.Add(EndpointChange{
 				When: time.Now(),
 				What: "handlePingLocked-bestAddr-update",
@@ -5077,19 +5184,23 @@ func portableTrySetSocketBuffer(pconn nettype.PacketConn, logf logger.Logf) {
 	}
 }
 
-// addrLatency is an IPPort with an associated latency.
-type addrLatency struct {
+// addrQuality is an IPPort with an associated latency and MTU.
+type addrQuality struct {
 	netip.AddrPort
 	latency time.Duration
+	mtu     int
 }
 
-func (a addrLatency) String() string {
-	return a.AddrPort.String() + "@" + a.latency.String()
+func (a addrQuality) String() string {
+	return a.AddrPort.String() + "@" + a.latency.String() + "+" + strconv.Itoa(a.mtu)
 }
 
 // betterAddr reports whether a is a better addr to use than b.
-func betterAddr(a, b addrLatency) bool {
+func betterAddr(a, b addrQuality) bool {
 	if a.AddrPort == b.AddrPort {
+		if a.mtu > b.mtu {
+			return true
+		}
 		return false
 	}
 	if !b.IsValid() {
@@ -5285,7 +5396,7 @@ func (de *endpoint) stopAndReset() {
 func (de *endpoint) resetLocked() {
 	de.lastSend = 0
 	de.lastFullPing = 0
-	de.bestAddr = addrLatency{}
+	de.bestAddr = addrQuality{}
 	de.bestAddrAt = 0
 	de.trustBestAddrUntil = 0
 	for _, es := range de.endpointState {

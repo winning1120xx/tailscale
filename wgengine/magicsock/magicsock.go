@@ -2073,6 +2073,32 @@ const (
 // speeds.
 var debugIPv4DiscoPingPenalty = envknob.RegisterDuration("TS_DISCO_PONG_IPV4_DELAY")
 
+// usefulMtus are the set of likely on-the-wire MTUs (including all the
+// layers of protocal headers above link layer)
+//
+// Each ping is kicked off with a separate go routine and they seem to
+// be run in approximately LIFO order, so if we want the biggest ping
+// to arrive first put it last?
+//
+// Debugging tips:
+//
+// To get exactly ONE ping of the desired MTU, do the following:
+//
+// 1. Set the below array to a single 0.
+// 2. Disable disco heartbeat with TS_DEBUG_ENABLE_SILENT_DISCO=1
+// 3. Send a single ping with ./tool/go run ./cmd/tailscale ping --mtu=1000 <host>
+
+var usefulMtus = [...]int{
+	0,
+	//576,  // Smallest MTU for IPv4, probably useless?
+	//1124, // An observed max mtu in the wild, maybe 1100 instead?
+	//1280, // Smallest MTU for IPv6, current default
+	//1400, // A little less, for tunnels or such
+	//1500, // Most common real world MTU
+	//8000, // Some jumbo frames are this size
+	//9000, // Most jumbo frames are this size or slightly larger
+}
+
 // sendDiscoMessage sends discovery message m to dstDisco at dst.
 //
 // If dst is a DERP IP:port, then dstKey must be non-zero.
@@ -4601,7 +4627,13 @@ func (de *endpoint) cliPing(res *ipnstate.PingResult, cb func(*ipnstate.PingResu
 		de.startDiscoPingLockedMTU(udpAddr, now, pingCLI, mtu)
 	} else {
 		for ep := range de.endpointState {
-			de.startDiscoPingLockedMTU(ep, now, pingCLI, mtu)
+			if mtu == 0 {
+				for _, testMtu := range usefulMtus {
+					de.startDiscoPingLockedMTU(ep, now, pingDiscovery, testMtu)
+				}
+			} else {
+				de.startDiscoPingLockedMTU(ep, now, pingCLI, mtu)
+			}
 		}
 	}
 	de.noteActiveLocked()
